@@ -8,7 +8,7 @@ run_sequential
 
 # Временные файлы, создаваемые parallel_min_max в режиме --by_files
 min_max_*.txt
-
+min_max.txt
 # Резервные копии редакторов
 *.swp
 *~
