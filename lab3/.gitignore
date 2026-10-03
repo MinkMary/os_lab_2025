@@ -1,0 +1,14 @@
+# Объектные файлы компиляции
+*.o
+
+# Исполняемые файлы (бинарники)
+sequential_min_max
+parallel_min_max
+run_sequential
+
+# Временные файлы, создаваемые parallel_min_max в режиме --by_files
+min_max_*.txt
+
+# Резервные копии редакторов
+*.swp
+*~
