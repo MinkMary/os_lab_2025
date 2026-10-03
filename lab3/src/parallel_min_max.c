@@ -5,15 +5,33 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <fcntl.h>
+
 #include <getopt.h>
 
 #include "find_min_max.h"
 #include "utils.h"
+
+static bool parse_int(const char *str, int min_value, int *result) {
+  char *end;
+  errno = 0;
+
+  long value = strtol(str, &end, 10);
+
+  if (end == str || *end != '\0' || errno == ERANGE ||
+      value < min_value || value > INT_MAX) {
+    return false;
+  }
+
+  *result = (int)value;
+  return true;
+}
 
 int main(int argc, char **argv) {
   int seed = -1;
@@ -22,8 +40,6 @@ int main(int argc, char **argv) {
   bool with_files = false;
 
   while (true) {
-    int current_optind = optind ? optind : 1;
-
     static struct option options[] = {{"seed", required_argument, 0, 0},
                                       {"array_size", required_argument, 0, 0},
                                       {"pnum", required_argument, 0, 0},
@@ -39,28 +55,38 @@ int main(int argc, char **argv) {
       case 0:
         switch (option_index) {
           case 0:
-            seed = atoi(optarg);
-            // your code here
-            // error handling
+            if (!parse_int(optarg, 0, &seed)) {
+              fprintf(stderr, "Ошибка: seed должен быть целым числом от 0 до %d\n",
+                      INT_MAX);
+              return 1;
+            }
             break;
+
           case 1:
-            array_size = atoi(optarg);
-            // your code here
-            // error handling
+            if (!parse_int(optarg, 1, &array_size)) {
+              fprintf(stderr, "Ошибка: array_size должен быть целым числом от 1 до %d\n",
+                      INT_MAX);
+              return 1;
+            }
             break;
+
           case 2:
-            pnum = atoi(optarg);
-            // your code here
-            // error handling
+            if (!parse_int(optarg, 1, &pnum)) {
+              fprintf(stderr, "Ошибка: pnum должен быть целым числом от 1 до %d\n",
+                      INT_MAX);
+              return 1;
+            }
             break;
+
           case 3:
             with_files = true;
             break;
 
-          defalut:
+          default:
             printf("Index %d is out of options\n", option_index);
         }
         break;
+
       case 'f':
         with_files = true;
         break;
@@ -79,64 +105,148 @@ int main(int argc, char **argv) {
   }
 
   if (seed == -1 || array_size == -1 || pnum == -1) {
-    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" \n",
+    printf("Usage: %s --seed \"num\" --array_size \"num\" --pnum \"num\" [--by_files]\n",
            argv[0]);
     return 1;
   }
 
   int *array = malloc(sizeof(int) * array_size);
+  if (array == NULL) {
+    perror("malloc");
+    return 1;
+  }
   GenerateArray(array, array_size, seed);
+
   int active_child_processes = 0;
 
   struct timeval start_time;
   gettimeofday(&start_time, NULL);
 
-  for (int i = 0; i < pnum; i++) {
-    pid_t child_pid = fork();
-    if (child_pid >= 0) {
-      // successful fork
-      active_child_processes += 1;
-      if (child_pid == 0) {
-        // child process
+  /* ---- Подготовка средств межпроцессного взаимодействия ---- */
 
-        // parallel somehow
-
-        if (with_files) {
-          // use files here
-        } else {
-          // use pipe here
-        }
-        return 0;
+  int pipefds[pnum][2];
+  if (!with_files) {
+    for (int i = 0; i < pnum; i++) {
+      if (pipe(pipefds[i]) == -1) {
+        perror("pipe");
+        free(array);
+        return 1;
       }
+    }
+  }
 
-    } else {
-      printf("Fork failed!\n");
+  int fd = -1;
+  if (with_files) {
+    fd = open("min_max.txt", O_RDWR | O_CREAT | O_TRUNC, 0666);
+    if (fd == -1) {
+      perror("open");
+      free(array);
       return 1;
     }
   }
 
-  while (active_child_processes > 0) {
-    // your code here
+  int slice = array_size / pnum;
 
+  /* ---- Запуск дочерних процессов ---- */
+
+  for (int i = 0; i < pnum; i++) {
+    pid_t child_pid = fork();
+
+    if (child_pid == -1) {
+      perror("fork");
+      free(array);
+      return 1;
+    }
+
+    if (child_pid == 0) {
+      /* ===== Дочерний процесс ===== */
+      int start = i * slice;
+      int end = (i == pnum - 1) ? array_size : (i + 1) * slice;
+
+      struct MinMax local = GetMinMax(array, start, end);
+      int buf[2] = {local.min, local.max};
+
+      if (with_files) {
+        if (write(fd, buf, sizeof(buf)) != (ssize_t)sizeof(buf)) {
+          perror("write to file");
+          exit(1);
+        }
+      } else {
+        /* Закрываем все чужие концы pipe'ов, унаследованные от родителя */
+        for (int j = 0; j < pnum; j++) {
+          if (j != i) {
+            close(pipefds[j][0]);
+            close(pipefds[j][1]);
+          }
+        }
+        close(pipefds[i][0]);
+        if (write(pipefds[i][1], buf, sizeof(buf)) != (ssize_t)sizeof(buf)) {
+          perror("write to pipe");
+          exit(1);
+        }
+        close(pipefds[i][1]);
+      }
+
+      exit(0);   /* ВАЖНО: exit, а не return */
+    }
+
+    /* ===== Родитель ===== */
+    active_child_processes += 1;
+
+    if (!with_files) {
+      /* Родителю запись в этот pipe не нужна */
+      close(pipefds[i][1]);
+    }
+  }
+
+  /* ---- Ожидание завершения всех детей ---- */
+
+  while (active_child_processes > 0) {
+    wait(NULL);
     active_child_processes -= 1;
   }
+
+  /* ---- Сбор результатов ---- */
 
   struct MinMax min_max;
   min_max.min = INT_MAX;
   min_max.max = INT_MIN;
 
+  if (with_files) {
+    if (lseek(fd, 0, SEEK_SET) == -1) {
+      perror("lseek");
+      free(array);
+      return 1;
+    }
+  }
+
   for (int i = 0; i < pnum; i++) {
-    int min = INT_MAX;
-    int max = INT_MIN;
+    int buf[2];
 
     if (with_files) {
-      // read from files
+      if (read(fd, buf, sizeof(buf)) != (ssize_t)sizeof(buf)) {
+        perror("read from file");
+        free(array);
+        return 1;
+      }
     } else {
-      // read from pipes
+      if (read(pipefds[i][0], buf, sizeof(buf)) != (ssize_t)sizeof(buf)) {
+        perror("read from pipe");
+        free(array);
+        return 1;
+      }
+      close(pipefds[i][0]);
     }
 
-    if (min < min_max.min) min_max.min = min;
-    if (max > min_max.max) min_max.max = max;
+    if (buf[0] < min_max.min) min_max.min = buf[0];
+    if (buf[1] > min_max.max) min_max.max = buf[1];
+  }
+
+  /* ---- Очистка ---- */
+
+  if (with_files) {
+    close(fd);
+    remove("min_max.txt");
   }
 
   struct timeval finish_time;
